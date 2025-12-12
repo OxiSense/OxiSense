@@ -25,6 +25,8 @@ The goal of Oxisense was to create a simple, portable, and reliable solution for
 
 Oxisense is a completed student project. The final prototype implements real-time pulse and SpO2 monitoring with on-device processing and display. The repository documents the finished hardware design, firmware, and initial groundwork for future extensions such as wireless communication and a dedicated mobile application.
 
+![IMG_5221](https://github.com/user-attachments/assets/835b55a0-af5c-4ba5-8d01-fd2cde003d40)  ![IMG_5220](https://github.com/user-attachments/assets/94a89627-dbc9-4ce2-9e7b-0d5143693980)
+
 ## Oxisense Team
 
 - Patrik Kassir
@@ -33,4 +35,5 @@ Oxisense is a completed student project. The final prototype implements real-tim
 - Tobias Brasiliero Reyes
 - Romeo Haddad
 - Simon Mahari
+
 

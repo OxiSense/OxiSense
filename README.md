@@ -1,8 +1,8 @@
 # Oxisense
 
-Oxisense is a microcontroller-based wearable designed to measure the user’s heart rate and oxygen saturation (SpO2) in real time. The project was developed as part of the master-level course Microcontroller (CM2036), which focuses on C programming, embedded hardware design, and real-time data processing in microcontroller systems.
+OxiSense is a microcontroller-based wearable system designed to measure heart rate (BPM) and oxygen saturation (SpO₂) in real time. The project was developed as part of the master-level course Microcontroller (CM2036), with a strong focus on C programming, embedded hardware design, and real-time data processing.
 
-The goal of Oxisense was to create a simple, portable, and reliable solution for monitoring vital signs in everyday life, during workouts, or as support for personal health tracking. As part of the project, the team also explored the concept of a companion mobile app to extend functionality and enable long-term data visualization.
+The goal of OxiSense was to create a simple, portable, and reliable solution for monitoring vital signs in everyday use and during physical activity. The system is complemented by a custom iOS application developed in Xcode using Swift, which communicates with the device over Bluetooth, retrieves logged sensor data, and visualizes BPM and SpO₂ measurements for long-term analysis.
 
 ## Features
 

@@ -1,0 +1,223 @@
+import SwiftUI
+import CoreBluetooth
+
+struct ContentView: View {
+    @EnvironmentObject var ble: BLEManager
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                // Lätt bakgrund
+                Color(UIColor.systemGroupedBackground)
+                    .ignoresSafeArea()
+
+                ScrollView {
+                    VStack(spacing: 16) {
+
+                        // ÖVERSTA KORTET – STATUS
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("OxiSense")
+                                    .font(.title2)
+                                    .fontWeight(.semibold)
+                                Spacer()
+                                Circle()
+                                    .fill(ble.isConnected ? Color.green : Color.red)
+                                    .frame(width: 12, height: 12)
+                            }
+
+                            Text(ble.isConnected
+                                 ? "Ansluten till: \(ble.deviceName)"
+                                 : "Inte ansluten")
+                                .font(.subheadline)
+                                .foregroundColor(ble.isConnected ? .green : .secondary)
+
+                            Text(ble.statusText)
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                                .padding(.top, 2)
+                        }
+                        .padding()
+                        .background(Color(.systemBackground))
+                        .cornerRadius(14)
+                        .shadow(color: Color.black.opacity(0.05), radius: 4, x: 0, y: 2)
+                        .padding(.horizontal)
+
+                        // SCAN / DISCONNECT
+                        HStack {
+                            Button {
+                                ble.startScanning()
+                            } label: {
+                                Label("Scan", systemImage: "dot.radiowaves.left.and.right")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(ble.isScanning)
+
+                            Button {
+                                ble.disconnect()
+                            } label: {
+                                Label("Disconnect", systemImage: "xmark.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
+                            .disabled(!ble.isConnected)
+
+                            Spacer()
+                        }
+                        .padding(.horizontal)
+
+                        // DEVICE-LISTA
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Enheter")
+                                .font(.headline)
+
+                            if ble.discoveredDevices.isEmpty {
+                                Text("Inga enheter hittade ännu.\nTryck på Scan för att söka.")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(ble.discoveredDevices) { dev in
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(dev.name.isEmpty ? "No name" : dev.name)
+                                                .font(.body)
+                                            Text(dev.peripheral.identifier.uuidString)
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        if ble.connectedPeripheral?.identifier == dev.peripheral.identifier {
+                                            Text("Connected")
+                                                .font(.caption)
+                                                .foregroundColor(.green)
+                                                .padding(6)
+                                                .background(Color.green.opacity(0.1))
+                                                .cornerRadius(8)
+                                        } else {
+                                            Button("Connect") {
+                                                ble.connect(to: dev)
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                        }
+                                    }
+                                    .padding(8)
+                                    .background(Color(.secondarySystemBackground))
+                                    .cornerRadius(10)
+                                }
+                            }
+                        }
+                        .padding()
+                        .background(Color(.systemBackground))
+                        .cornerRadius(14)
+                        .shadow(color: Color.black.opacity(0.05), radius: 4, x: 0, y: 2)
+                        .padding(.horizontal)
+
+                        // HUVUDKONTROLL – BARA START & STOP
+                        VStack(spacing: 12) {
+                            Text("Mätning")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button {
+                                ble.sendStartLoggingToDevice()
+                            } label: {
+                                HStack {
+                                    Image(systemName: "play.fill")
+                                    Text("Starta loggning")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.green)
+                            .disabled(!ble.isConnected)
+
+                            Button {
+                                ble.sendStopAndFetch()
+                            } label: {
+                                HStack {
+                                    Image(systemName: "stop.fill")
+                                    Text("Stoppa & hämta logg")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .disabled(!ble.isConnected)
+                        }
+                        .padding()
+                        .background(Color(.systemBackground))
+                        .cornerRadius(14)
+                        .shadow(color: Color.black.opacity(0.05), radius: 4, x: 0, y: 2)
+                        .padding(.horizontal)
+
+                        // SPARADE FILER (för att öppna och visa grafer)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Sparade loggfiler")
+                                .font(.headline)
+
+                            if ble.savedFiles.isEmpty {
+                                Text("Inga loggfiler ännu.\nStarta en mätning och stoppa den för att spara.")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(ble.savedFiles, id: \.self) { file in
+                                    NavigationLink(
+                                        destination: LogFileDetailView(fileName: file)
+                                            .environmentObject(ble)
+                                    ) {
+                                        HStack {
+                                            Image(systemName: "doc.text.magnifyingglass")
+                                            Text(file)
+                                            Spacer()
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        .padding(8)
+                                    }
+                                    .background(Color(.secondarySystemBackground))
+                                    .cornerRadius(10)
+                                }
+                            }
+                        }
+                        .padding()
+                        .background(Color(.systemBackground))
+                        .cornerRadius(14)
+                        .shadow(color: Color.black.opacity(0.05), radius: 4, x: 0, y: 2)
+                        .padding(.horizontal)
+
+                        // DEBUG LOG – om du vill ha kvar den
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Debug log")
+                                .font(.headline)
+
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 2) {
+                                    ForEach(Array(ble.logLines.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
+                                            .font(.caption2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                            .frame(minHeight: 80, maxHeight: 160)
+                            .background(Color(UIColor.systemGray6))
+                            .cornerRadius(8)
+                        }
+                        .padding()
+                        .background(Color(.systemBackground))
+                        .cornerRadius(14)
+                        .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 1)
+                        .padding(.horizontal)
+                        .padding(.bottom, 16)
+                    }
+                }
+            }
+            .navigationTitle("OxiSense")
+        }
+    }
+}

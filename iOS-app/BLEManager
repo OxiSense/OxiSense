@@ -1,0 +1,528 @@
+// BLEManager.swift
+import Foundation
+import CoreBluetooth
+import Combine
+
+struct BLEDevice: Identifiable, Equatable {
+    let id = UUID()
+    let name: String
+    let peripheral: CBPeripheral
+    static func == (lhs: BLEDevice, rhs: BLEDevice) -> Bool {
+        lhs.peripheral.identifier == rhs.peripheral.identifier
+    }
+}
+
+final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+
+    // MARK: - Public state
+    @Published var discoveredDevices: [BLEDevice] = []
+    @Published var isConnected = false
+    @Published var isScanning = false
+    @Published var isLogging = false
+    @Published var inCmdMode = false
+    @Published var statusText = "Idle"
+    @Published var deviceName = ""
+    @Published var logLines: [String] = []
+
+    // Fil-hantering (UI)
+    @Published var lastFileName: String = ""
+    @Published var lastFileContent: String = ""
+    @Published var savedFiles: [String] = []
+
+    // MARK: - BLE
+    private var central: CBCentralManager!
+    var connectedPeripheral: CBPeripheral?
+    private var uartCharacteristic: CBCharacteristic?
+
+    // RN4871 MLDP UART
+    private let uartServiceUUID = CBUUID(string: "49535343-FE7D-4AE5-8FA9-9FAFD205E455")
+    private let uartCharUUID    = CBUUID(string: "49535343-1E4D-4BD9-BA61-23C647249616")
+
+    // Parser-buffert (för rader/kvittenser när vi INTE tar emot fil)
+    private var rxBuffer: String = ""
+
+    // Filmottagning (stream-läge)
+    private var fileReceiving = false
+    private var fileBuffer: String = ""
+    private var currentFileName = ""
+
+    // STOP → READ_LAST
+    private var pendingFetchAfterStop = false
+    private var fallbackTimer: DispatchWorkItem?
+
+    // MARK: - Init
+    override init() {
+        super.init()
+        central = CBCentralManager(delegate: self, queue: nil)
+        loadSavedFilesFromDisk()
+    }
+
+    // MARK: - Logg
+    private func appendLog(_ line: String) {
+        DispatchQueue.main.async {
+            self.logLines.append(line)
+            if self.logLines.count > 300 {
+                self.logLines.removeFirst(self.logLines.count - 300)
+            }
+        }
+    }
+
+    // MARK: - Sändning
+    private func sendRaw(_ text: String) {
+        guard isConnected,
+              let per = connectedPeripheral,
+              let ch = uartCharacteristic else {
+            statusText = "Not connected"
+            return
+        }
+        appendLog("TX: \(text.replacingOccurrences(of: "\r\n", with: "\\r\\n"))")
+        if let data = text.data(using: .utf8) {
+            per.writeValue(data, for: ch, type: .withResponse)
+        }
+    }
+
+    /// Skicka bara '$' (MCU går i cmd_mode på detta)
+    private func sendEnterCmd(reason: String) {
+        guard isConnected,
+              let per = connectedPeripheral,
+              let ch = uartCharacteristic else {
+            statusText = "Not connected"
+            return
+        }
+        let cmd = "$"
+        appendLog("TX: \(cmd) [\(reason)]")
+        per.writeValue(cmd.data(using: .utf8)!, for: ch, type: .withResponse)
+    }
+
+    /// Skicka '$' och efter en kort delay själva kommando-raden
+    private func sendCmdWithEnter(_ cmd: String, reason: String) {
+        guard isConnected else {
+            statusText = "Not connected"
+            return
+        }
+        sendEnterCmd(reason: reason)
+        statusText = "Sending $ for \(reason)…"
+
+        // Liten paus så RN4871/MCU hinner slå om till cmd-läge
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            self.sendRaw(cmd)
+            self.statusText = "Sent \(reason)"
+        }
+    }
+
+    // MARK: - Fil-lagring
+    private func logsDirectoryURL() -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = docs.appendingPathComponent("logs", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+    private func fileURL(for fileName: String) -> URL { logsDirectoryURL().appendingPathComponent(fileName) }
+
+    private func loadSavedFilesFromDisk() {
+        let dir = logsDirectoryURL()
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
+            DispatchQueue.main.async { self.savedFiles = items.sorted() }
+        } else {
+            self.savedFiles = []
+        }
+    }
+
+    private func saveReceivedFileToDisk(name: String, content: String) {
+        do {
+            try content.data(using: .utf8)?.write(to: fileURL(for: name), options: .atomic)
+            DispatchQueue.main.async {
+                if !self.savedFiles.contains(name) {
+                    self.savedFiles.append(name)
+                    self.savedFiles.sort()
+                }
+            }
+            appendLog("Saved file: \(name)")
+        } catch {
+            appendLog("ERROR saving file \(name): \(error.localizedDescription)")
+            DispatchQueue.main.async { self.statusText = "Error saving file \(name)" }
+        }
+    }
+
+    func loadFileContent(name: String) -> String {
+        (try? String(contentsOf: fileURL(for: name), encoding: .utf8)) ?? ""
+    }
+
+    // MARK: - RX → streaming parser
+    private func handleIncomingData(_ text: String) {
+        // Visa rå RX i debug
+        let printable = text
+            .replacingOccurrences(of: "\r\n", with: "\\r\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        appendLog("RX: \(printable)")
+
+        if fileReceiving {
+            // Vi är i fil-läge: buffra allt och titta efter "FILE_END"
+            fileBuffer.append(text)
+
+            // Sök case-insensitive efter FILE_END (kan ligga var som helst)
+            if let range = fileBuffer.range(of: "FILE_END", options: [.caseInsensitive]) {
+                // Innehåll = allt före token. Trimma bort en ev. sista CRLF före token.
+                let fileContentPart = String(fileBuffer[..<range.lowerBound])
+                let cleaned = fileContentPart.replacingOccurrences(of: "\r\n$", with: "", options: .regularExpression)
+
+                // Spara fil och uppdatera UI
+                DispatchQueue.main.async {
+                    self.lastFileName = self.currentFileName
+                    self.lastFileContent = cleaned
+                    self.statusText = "Received file \(self.currentFileName)"
+                }
+                saveReceivedFileToDisk(name: currentFileName, content: cleaned)
+                appendLog("APP: FILE_END seen → saved \(currentFileName) (\(cleaned.count) chars)")
+
+                // Rensa file-läge och lämna ev. data efter FILE_END till radparsern
+                let after = String(fileBuffer[range.upperBound...])
+                fileReceiving = false
+                fileBuffer = ""
+                currentFileName = ""
+
+                if !after.isEmpty {
+                    rxBuffer.append(after)
+                    processRXBufferForLinesAndAcks()
+                }
+                return
+            }
+
+            // Fortsätt samla tills FILE_END dyker upp
+            return
+        }
+
+        // Inte i fil-läge: ack/rader via rxBuffer
+        rxBuffer.append(text)
+        processRXBufferForLinesAndAcks()
+    }
+
+    /// Hjälper till att flytta ev. kvarvarande raddata in i filbufferten när fil-läget startar
+    private func moveRXIntoFileBufferIfNeeded() {
+        if fileReceiving, !rxBuffer.isEmpty {
+            fileBuffer.append(rxBuffer)
+            appendLog("APP: moved \(rxBuffer.count) bytes from rxBuffer into fileBuffer after FILE_BEGIN")
+            rxBuffer.removeAll()
+        }
+    }
+
+    /// Plockar ut rader ur rxBuffer, *och* matchar kvittenser robust.
+    private func processRXBufferForLinesAndAcks() {
+        // Om vi råkat slå över till fileReceiving mitt i – flytta allt kvarvarande rakt in i filbufferten.
+        if fileReceiving {
+            moveRXIntoFileBufferIfNeeded()
+            return
+        }
+
+        // Vanlig rad-parsing
+        while let lineRange = rxBuffer.range(of: "\r\n") ?? rxBuffer.range(of: "\n") {
+            let rawLine = String(rxBuffer[..<lineRange.lowerBound])
+            rxBuffer.removeSubrange(..<lineRange.upperBound)
+
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { continue }
+
+            handleOneLine(line)
+
+            // Om handleOneLine slog över till fileReceiving, flytta direkt in resten
+            if fileReceiving {
+                moveRXIntoFileBufferIfNeeded()
+                return
+            }
+        }
+
+        // Token-matchning även utan radslut
+        if rxBuffer.range(of: "OK STOP_LOG", options: [.caseInsensitive]) != nil ||
+           rxBuffer.range(of: "OK STOP LOGGING", options: [.caseInsensitive]) != nil {
+            handleOneLine("OK STOP_LOG")
+            rxBuffer = rxBuffer.replacingOccurrences(of: "(?i)OK STOP LOGGING", with: "", options: .regularExpression)
+            rxBuffer = rxBuffer.replacingOccurrences(of: "(?i)OK STOP_LOG", with: "", options: .regularExpression)
+        }
+
+        if rxBuffer.range(of: "CMD MODE ACTIVE", options: [.caseInsensitive]) != nil ||
+           rxBuffer.range(of: "CMD?", options: [.caseInsensitive]) != nil {
+            handleOneLine("CMD MODE ACTIVE")
+            rxBuffer = rxBuffer.replacingOccurrences(of: "(?i)CMD\\? ?", with: "", options: .regularExpression)
+            rxBuffer = rxBuffer.replacingOccurrences(of: "(?i)CMD MODE ACTIVE", with: "", options: .regularExpression)
+        }
+    }
+
+    /// Behandla en enskild ”rad”/token (kvittenser + FILE_BEGIN)
+    private func handleOneLine(_ line: String) {
+        let upper = line.uppercased()
+
+        // Start på filöverföring
+        if upper.hasPrefix("FILE_BEGIN ") {
+            // ex: "FILE_BEGIN 20251119.TXT"
+            let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            currentFileName = parts.count >= 2 ? String(parts[1]) : "log.txt"
+            fileBuffer = ""
+            fileReceiving = true
+
+            // Avbryt ev. fallback – filen är på väg
+            fallbackTimer?.cancel(); fallbackTimer = nil
+            pendingFetchAfterStop = false
+
+            // VIKTIGT: flytta direkt kvarvarande rxBuffer (kan innehålla "time,mV\r\n" etc.)
+            moveRXIntoFileBufferIfNeeded()
+
+            DispatchQueue.main.async { self.statusText = "Receiving file \(self.currentFileName)…" }
+            appendLog("APP: FILE_BEGIN \(currentFileName)")
+            return
+        }
+
+        // STOP_LOG kvittens
+        if upper.contains("OK STOP_LOG") || upper.contains("OK STOP LOGGING") {
+            appendLog("APP: received STOP ack")
+            DispatchQueue.main.async {
+                self.statusText = "Logging stopped"
+                self.inCmdMode = false
+                self.isLogging = false
+            }
+
+            if pendingFetchAfterStop {
+                pendingFetchAfterStop = false
+                // Skicka READ_LAST strax efter STOP-ack
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                    self.sendCmdWithEnter("READ_LAST\r\n", reason: "READ_LAST after STOP")
+                }
+                DispatchQueue.main.async { self.statusText = "Stopped – fetching last file…" }
+            }
+            return
+        }
+
+        // CMD-läge
+        if upper.contains("CMD MODE ACTIVE") || upper.contains("CMD?") {
+            DispatchQueue.main.async {
+                self.inCmdMode = true
+                self.statusText = "MCU cmd_mode ACTIVE"
+            }
+            return
+        }
+
+        // Start-log ack
+        if upper.contains("OK START LOGGING") {
+            DispatchQueue.main.async {
+                self.statusText = "Logging started"
+                self.inCmdMode = false
+                self.isLogging = true
+            }
+            return
+        }
+
+        // Time-synk ack
+        if upper.contains("OK TIME ONLY FATTIME") || upper.contains("OK DATETIME FATTIME") {
+            DispatchQueue.main.async {
+                self.statusText = "Time synced"
+                self.inCmdMode = false
+            }
+            return
+        }
+
+        // Errorrad
+        if upper.hasPrefix("ERR") {
+            DispatchQueue.main.async { self.statusText = "MCU error: \(line)" }
+            return
+        }
+
+        // default – visa som status
+        DispatchQueue.main.async { self.statusText = line }
+    }
+
+    // MARK: - Scan / Connect
+    func startScanning() {
+        DispatchQueue.main.async {
+            self.discoveredDevices.removeAll()
+            self.inCmdMode = false
+            self.statusText = "Scanning…"
+            self.isScanning = true
+        }
+
+        if central.state == .poweredOn {
+            central.scanForPeripherals(withServices: nil, options: nil)
+        } else {
+            DispatchQueue.main.async {
+                self.statusText = "Bluetooth not powered on"
+                self.isScanning = false
+            }
+        }
+    }
+
+    func stopScanning() {
+        central.stopScan()
+        DispatchQueue.main.async {
+            self.statusText = "Scan stopped"
+            self.isScanning = false
+        }
+    }
+
+    func connect(to device: BLEDevice) {
+        stopScanning()
+        connectedPeripheral = device.peripheral
+        connectedPeripheral?.delegate = self
+        statusText = "Connecting to \(device.name)…"
+        central.connect(device.peripheral, options: nil)
+    }
+
+    func disconnect() {
+        guard let p = connectedPeripheral else { return }
+        central.cancelPeripheralConnection(p)
+        statusText = "Disconnecting…"
+    }
+
+    // MARK: - UI-kommandon
+    func sendTest() {
+        sendRaw("TEST\r\n")
+        statusText = "Sent TEST"
+    }
+
+    func sendSetTimeToDevice() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let cmd = "SET_TIME \(df.string(from: Date()))\r\n"
+        sendCmdWithEnter(cmd, reason: "SET_TIME")
+    }
+
+    func sendStartLoggingToDevice() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let cmd = "START_LOG \(df.string(from: Date()))\r\n"
+        sendCmdWithEnter(cmd, reason: "START_LOG")
+    }
+
+    /// Bara STOP_LOG (utan hämtning)
+    func sendStopLoggingToDevice() {
+        sendCmdWithEnter("STOP_LOG\r\n", reason: "STOP_LOG")
+    }
+
+    /// STOP + auto READ_LAST när STOP-ack landar (fallback om ack aldrig syns)
+    func sendStopAndFetch() {
+        // Avbryt ev. tidigare fallback
+        fallbackTimer?.cancel(); fallbackTimer = nil
+
+        pendingFetchAfterStop = true
+        sendCmdWithEnter("STOP_LOG\r\n", reason: "STOP_LOG (for fetch)")
+        statusText = "Sent STOP_LOG (waiting ack)…"
+
+        // Fallback om vi aldrig ser STOP-ack
+        let fb = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.pendingFetchAfterStop {
+                self.appendLog("FALLBACK: STOP ack missing → sending READ_LAST")
+                self.pendingFetchAfterStop = false
+                self.sendCmdWithEnter("READ_LAST\r\n", reason: "fallback READ_LAST")
+            }
+        }
+        fallbackTimer = fb
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: fb)
+    }
+
+    /// Endast READ_LAST (manuell debug)
+    func sendReadLastDebug() {
+        sendCmdWithEnter("READ_LAST\r\n", reason: "READ_LAST debug")
+        statusText = "Sent READ_LAST (debug)…"
+    }
+
+    // MARK: - CBCentralManagerDelegate
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn:
+            statusText = "Bluetooth ON – scanning…"
+            startScanning()
+        case .poweredOff:
+            statusText = "Bluetooth OFF"
+            isScanning = false
+        case .resetting:
+            statusText = "Resetting…"
+        case .unauthorized:
+            statusText = "Unauthorized"
+        case .unsupported:
+            statusText = "Unsupported"
+        case .unknown:
+            fallthrough
+        @unknown default:
+            statusText = "Unknown state"
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String : Any],
+                        rssi RSSI: NSNumber) {
+
+        // Ta fram namnet – och säkerställ att det börjar på "RN4871"
+        guard let name = peripheral.name,
+              name.uppercased().hasPrefix("RN4871") else {
+            return
+        }
+
+        let dev = BLEDevice(name: name, peripheral: peripheral)
+
+        DispatchQueue.main.async {
+            if !self.discoveredDevices.contains(dev) {
+                self.discoveredDevices.append(dev)
+            }
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        DispatchQueue.main.async {
+            self.isConnected = true
+            self.deviceName  = peripheral.name ?? "Unknown"
+            self.statusText  = "Connected → discovering services…"
+            self.isLogging   = false
+            self.inCmdMode   = false
+        }
+        peripheral.delegate = self
+        peripheral.discoverServices([uartServiceUUID])
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        DispatchQueue.main.async {
+            self.statusText = "Failed to connect: \(error?.localizedDescription ?? "unknown error")"
+            self.isConnected = false
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.inCmdMode   = false
+            self.uartCharacteristic = nil
+            self.statusText  = "Disconnected"
+            self.isLogging   = false
+        }
+    }
+
+    // MARK: - CBPeripheralDelegate
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let services = peripheral.services else { return }
+        for svc in services where svc.uuid == uartServiceUUID {
+            peripheral.discoverCharacteristics([uartCharUUID], for: svc)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didDiscoverCharacteristicsFor service: CBService,
+                    error: Error?) {
+        guard let chars = service.characteristics else { return }
+        for ch in chars where ch.uuid == uartCharUUID {
+            uartCharacteristic = ch
+            peripheral.setNotifyValue(true, for: ch)
+            DispatchQueue.main.async { self.statusText = "UART ready" }
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didUpdateValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard let data = characteristic.value,
+              let text = String(data: data, encoding: .utf8) else { return }
+        handleIncomingData(text)
+    }
+}

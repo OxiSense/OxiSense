@@ -1,0 +1,13 @@
+import Foundation
+
+struct BPMPoint: Identifiable {
+    var id = UUID()
+    var date: Date          // när samplet togs
+    var bpm: Int            // puls
+
+    var minuteLabel: String {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm"
+        return df.string(from: date)
+    }
+}

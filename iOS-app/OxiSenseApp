@@ -1,0 +1,19 @@
+//
+//  OxisenseApp.swift
+//  Oxisense
+//
+//  Created by Romeo Haddad on 2025-11-17.
+//
+import SwiftUI
+
+@main
+struct BLELoggerApp: App {
+    @StateObject private var ble = BLEManager()
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(ble)
+        }
+    }
+}

@@ -1,0 +1,52 @@
+import SwiftUI
+import Charts
+
+struct BPMGraphView: View {
+    let bpmPoints: [BPMPoint]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("BPM – sample var tredje sekund")
+                .font(.headline)
+
+            if bpmPoints.isEmpty {
+                Text("Ingen BPM-data att visa.")
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                Chart(bpmPoints) { point in
+                    LineMark(
+                        x: .value("Tid", point.date),
+                        y: .value("BPM", point.bpm)
+                    )
+                    PointMark(
+                        x: .value("Tid", point.date),
+                        y: .value("BPM", point.bpm)
+                    )
+                }
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 6)) { value in
+                        AxisGridLine()
+                        AxisValueLabel(format: .dateTime.hour().minute())
+                    }
+                }
+                .frame(height: 260)
+
+                List {
+                    ForEach(bpmPoints) { p in
+                        HStack {
+                            Text(p.minuteLabel)   // t.ex. "14:35"
+                            Spacer()
+                            Text("\(p.bpm) BPM")
+                        }
+                    }
+                }
+            }
+
+            Spacer()
+        }
+        .padding()
+        .navigationTitle("BPM-graf")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}

@@ -1,0 +1,138 @@
+import SwiftUI
+
+struct LogFileDetailView: View {
+    @EnvironmentObject var ble: BLEManager
+    let fileName: String
+
+    @State private var content: String = ""
+    @State private var bpmPoints: [BPMPoint] = []
+
+    @State private var avgBPM: Double?
+    @State private var avgSpO2: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(fileName)
+                .font(.headline)
+
+            Divider()
+
+            if bpmPoints.isEmpty {
+                Text("Ingen BPM-data hittades i filen (eller bara ogiltiga värden).")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+
+                // ---- SNITTVÄRDEN ----
+                VStack(alignment: .leading, spacing: 4) {
+                    if let avgBPM {
+                        Text(String(format: "Snittpuls: %.1f BPM", avgBPM))
+                    }
+                    if let avgSpO2 {
+                        Text(String(format: "Snitt syremättnad: %.1f %%", avgSpO2))
+                    }
+                }
+                .font(.subheadline)
+
+                // ---- GRAFEN DIREKT ----
+                BPMGraphView(bpmPoints: bpmPoints)
+            }
+
+            Spacer()
+        }
+        .padding()
+        .navigationTitle("Loggdetaljer")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            content = ble.loadFileContent(name: fileName)
+            let parsed = parseLog(from: content)
+            bpmPoints = parsed.points
+            avgBPM    = parsed.avgBPM
+            avgSpO2   = parsed.avgSpO2
+        }
+    }
+
+    // MARK: - Parser: logg → BPMPoints + snittvärden
+
+    private func parseLog(from text: String) -> (points: [BPMPoint],
+                                                avgBPM: Double?,
+                                                avgSpO2: Double?) {
+
+        let lines = text.components(separatedBy: .newlines)
+        if lines.isEmpty { return ([], nil, nil) }
+
+        var points: [BPMPoint] = []
+
+        var bpmSum = 0
+        var bpmCount = 0
+
+        var spo2Sum = 0
+        var spo2Count = 0
+
+        let calendar = Calendar.current
+        var base = DateComponents()
+        base.year = 2000
+        base.month = 1
+        base.day = 1
+
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { continue }
+            if line.lowercased().hasPrefix("time") { continue }
+            if line.uppercased().hasPrefix("FILE_BEGIN") { continue }
+
+            // Ex: "14:35:12.123,SPO2=98,BPM=75"
+            let parts = line.split(separator: ",")
+            if parts.count < 2 { continue }
+
+            let timePart = String(parts[0])
+
+            // --- TID → Date ---
+            let tParts = timePart.split(separator: ":")
+            if tParts.count < 2 { continue }
+
+            let h = Int(tParts[0]) ?? 0
+            let m = Int(tParts[1]) ?? 0
+            let secPart = tParts.count > 2
+                ? tParts[2].split(separator: ".").first ?? tParts[2]
+                : Substring("0")
+            let s = Int(secPart) ?? 0
+
+            var comps = base
+            comps.hour = h
+            comps.minute = m
+            comps.second = s
+            guard let date = calendar.date(from: comps) else { continue }
+
+            // --- SPO2 ---
+            if let spo2Token = parts.first(where: { $0.uppercased().contains("SPO2=") }) {
+                let spo2Str = spo2Token
+                    .replacingOccurrences(of: "SPO2=", with: "", options: .caseInsensitive)
+                    .trimmingCharacters(in: .whitespaces)
+                if let spo2Val = Int(spo2Str), spo2Val > 0, spo2Val <= 100 {
+                    spo2Sum += spo2Val
+                    spo2Count += 1
+                }
+            }
+
+            // --- BPM ---
+            if let bpmToken = parts.first(where: { $0.uppercased().contains("BPM=") }) {
+                let bpmStr = bpmToken
+                    .replacingOccurrences(of: "BPM=", with: "", options: .caseInsensitive)
+                    .trimmingCharacters(in: .whitespaces)
+
+                if let bpmVal = Int(bpmStr), bpmVal > 0, bpmVal <= 250 {
+                    points.append(BPMPoint(date: date, bpm: bpmVal))
+                    bpmSum += bpmVal
+                    bpmCount += 1
+                }
+            }
+        }
+
+        let avgBPM  = bpmCount  > 0 ? Double(bpmSum)  / Double(bpmCount)  : nil
+        let avgSpO2 = spo2Count > 0 ? Double(spo2Sum) / Double(spo2Count) : nil
+
+        return (points, avgBPM, avgSpO2)
+    }
+}
